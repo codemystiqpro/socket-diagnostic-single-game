@@ -1,34 +1,33 @@
 'use strict';
 /**
- * Simple connect check — NO DB, NO Socket, NO frontend, NO round endpoint
- * Direct upstream URLs se fetch karta hai, 4 baar, log me response likhta hai.
- *
- * Direct values (env se override kar sakte ho):
- *   SPORTS_UPSTREAM_URL=https://allpenellexch.com:8443/
- *   SPORTS_SCOREBOARD_ORIGIN=https://api.trubets365.com
- *   SPORTS_STALE_MS=60000
- *   SPORTS_REFRESH_MS=20000
+ * Direct provider feed check — NO DB, NO frontend, NO round endpoint
+ * Provider: https://allpenellexch.com:2053/
+ * Socket: wss://allpenellexch.com:2053/socket.io/?EIO=4&transport=websocket
+ * Game: Instant Teenpatti 2.0 (live_teen32) — Room event me 'teen32' bhejta hai
+ * Provider 'game' event me live packet deta hai:
+ *   t1[0].mid = round ID, t1[0].autotime = timer (lt fallback), serverTime = provider timestamp
+ * Results 'gameResult' event par aate hain.
  *
  * Usage:
  *   node scripts/socket-diagnostic.js
+ *   node scripts/socket-diagnostic.js --game live_teen32 --room teen32
  *
  * Log: logs/socket-diagnostic.log
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const { io } = require('socket.io-client');
 
-const SPORTS_UPSTREAM_URL = process.env.SPORTS_UPSTREAM_URL || 'https://allpenellexch.com:8443/';
-const SPORTS_SCOREBOARD_ORIGIN = process.env.SPORTS_SCOREBOARD_ORIGIN || 'https://api.trubets365.com';
-const SPORTS_STALE_MS = Number(process.env.SPORTS_STALE_MS || 60000);
-const SPORTS_REFRESH_MS = Number(process.env.SPORTS_REFRESH_MS || 20000);
+const argv = process.argv.slice(2);
+function argVal(name, def) {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : def;
+}
 
-const TIMES = 4;
-const GAP_MS = SPORTS_REFRESH_MS; // 20 second gap
-
-const ENDPOINTS = [
-  SPORTS_UPSTREAM_URL,
-  SPORTS_SCOREBOARD_ORIGIN,
-];
+const PROVIDER_URL = process.env.SPORTS_UPSTREAM_URL || 'https://allpenellexch.com:2053/';
+const GAME_SLUG = argVal('--game', process.env.DIAG_GAME_ID || 'live_teen32');
+const ROOM = argVal('--room', process.env.DIAG_ROOM || 'teen32');
+const RUN_MS = Number(argVal('--duration', process.env.DIAG_MS || 120000));
 
 const logDir = path.join(__dirname, '..', 'logs');
 fs.mkdirSync(logDir, { recursive: true });
@@ -42,51 +41,83 @@ function log(line) {
   console.log(text.trim());
 }
 
-async function fetchOnce(n, url) {
-  log(`TRY ${n}/${TIMES} GET ${url}`);
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 20000);
-  const start = Date.now();
-  try {
-    const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json, text/html, */*' } });
-    clearTimeout(t);
-    const body = (await res.text()).slice(0, 500);
-    const ms = Date.now() - start;
-    log(`TRY ${n} RESPONSE status=${res.status} ok=${res.ok} time=${ms}ms body=${body}`);
-    return { ok: res.ok, status: res.status };
-  } catch (e) {
-    clearTimeout(t);
-    const reason = e.name === 'AbortError' ? 'TIMEOUT 20s — upstream ne jawab nahi diya' : e.message;
-    log(`TRY ${n} ERROR ${reason}`);
-    return { ok: false, status: null, error: reason };
-  }
-}
+const state = {
+  connected: false,
+  connectError: '',
+  gameEvents: 0,
+  gameResultEvents: 0,
+  lastRoundId: '',
+  lastTimer: '',
+  lastServerTime: 0,
+};
 
 async function main() {
-  log(`START direct upstream check | times=${TIMES} gap=${GAP_MS}ms stale=${SPORTS_STALE_MS}ms`);
-  log(`UPSTREAM=${SPORTS_UPSTREAM_URL}`);
-  log(`SCOREBOARD=${SPORTS_SCOREBOARD_ORIGIN}`);
-  let anyResponse = 0;
-  for (let n = 1; n <= TIMES; n += 1) {
-    const url = ENDPOINTS[(n - 1) % ENDPOINTS.length];
-    const r = await fetchOnce(n, url);
-    if (r.status) anyResponse += 1;
-    if (n < TIMES) {
-      log(`WAIT ${GAP_MS / 1000}s before next try...`);
-      await new Promise((r2) => setTimeout(r2, GAP_MS));
+  log(`START direct provider feed check | provider=${PROVIDER_URL} game=${GAME_SLUG} room=${ROOM} run=${RUN_MS}ms`);
+
+  const upstream = io(PROVIDER_URL, {
+    transports: ['websocket', 'polling'],
+    tryAllTransports: true,
+    timeout: 18000,
+    reconnectionDelay: 2000,
+  });
+
+  upstream.on('connect', () => {
+    state.connected = true;
+    log(`CONNECTED id=${upstream.id} transport=${upstream.io.engine.transport.name}`);
+    upstream.emit('Room', ROOM);
+    log(`EMIT Room=${ROOM}`);
+  });
+
+  upstream.on('connect_error', (err) => {
+    state.connectError = err.message;
+    log(`CONNECT_ERROR message=${err.message}`);
+  });
+
+  upstream.on('disconnect', (reason) => {
+    log(`DISCONNECTED reason=${reason}`);
+  });
+
+  upstream.on('game', (data) => {
+    state.gameEvents += 1;
+    const t1 = data?.t1?.[0] || {};
+    const roundId = t1.mid || '';
+    const timer = t1.autotime ?? t1.lt ?? '';
+    const serverTime = Number(data?.serverTime) || 0;
+    state.lastRoundId = roundId;
+    state.lastTimer = String(timer);
+    state.lastServerTime = serverTime;
+    log(`GAME #${state.gameEvents} roundId=${roundId} timer=${timer} serverTime=${serverTime}`);
+  });
+
+  upstream.on('gameResult', (data) => {
+    state.gameResultEvents += 1;
+    log(`GAMERESULT #${state.gameResultEvents} data=${JSON.stringify(data).slice(0, 500)}`);
+  });
+
+  upstream.onAny((event, ...args) => {
+    if (event === 'game' || event === 'gameResult') return;
+    log(`EVENT ${event} args=${JSON.stringify(args).slice(0, 500)}`);
+  });
+
+  setTimeout(() => {
+    log('--- VERDICT ---');
+    log(`CONNECTED: ${state.connected} | connectError=${state.connectError || 'none'}`);
+    log(`GAME EVENTS: ${state.gameEvents} | GAMERESULT EVENTS: ${state.gameResultEvents}`);
+    log(`LAST roundId=${state.lastRoundId} timer=${state.lastTimer} serverTime=${state.lastServerTime}`);
+    if (!state.connected) {
+      log('VERDICT: CONNECT NAHI HO RAHA — provider Socket connect nahi hua. Reason: ' + (state.connectError || 'unknown'));
+    } else if (state.gameEvents === 0) {
+      log('VERDICT: CONNECT HO RAHA HAI, PAR GAME DATA NAHI AA RAHA — Room join hua par 2 min me koi game event nahi aayi. Room galat ho sakta hai ya provider us room me data nahi bhej raha.');
+    } else {
+      log('VERDICT: CONNECT HO RAHA HAI, GAME DATA AA RAHA HAI — roundId aur timer mil rahe hain. Agar apne game page pe phir bhi blank hai to problem backend ke bridge / frontend me hai, provider me nahi.');
     }
-  }
-  log('--- VERDICT ---');
-  log(`TOTAL TRIES: ${TIMES} | KOI RESPONSE AAYA: ${anyResponse}`);
-  if (anyResponse === 0) {
-    log('VERDICT: CONNECT NAHI HO RAHA — upstream se koi response nahi aaya. Upstream down / block / URL galat.');
-  } else {
-    log('VERDICT: CONNECT HO RAHA HAI — upstream respond kar raha hai. Agar game me round/odds nahi aa rahe to problem backend ke feed parse / socket wale hisse ki hai, upstream connect ki nahi.');
-  }
-  log('DONE direct upstream check');
+    log('DONE direct provider feed check');
+    try { upstream.disconnect(); } catch (e) { log(`DISCONNECT_ERROR ${e.message}`); }
+    process.exit(0);
+  }, RUN_MS);
 }
 
 main().catch((err) => {
-  log(`FATAL ${err.message}`);
+  log(`FATAL ${err.message} | ${err.stack}`);
   process.exit(1);
 });
